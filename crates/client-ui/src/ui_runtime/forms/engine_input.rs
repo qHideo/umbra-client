@@ -1,0 +1,720 @@
+//! Input for a form drawn by the JSON-UI engine. Raw pointer and keyboard
+//! edges become vanilla input buttons (`button.menu_select`, `button.menu_ok`,
+//! …) that the engine's dispatcher routes through the template's button
+//! mappings to its components; this module is the form's screen controller,
+//! turning the resulting screen events into form values and answers.
+
+use json_ui::{
+    ButtonEvent, ButtonInput as EngineButton, Dispatch, HitKind, HitRegion, InputMode,
+    PointerInput, ScreenEvent, hit_test,
+};
+use protocol::{CustomFormElement, MenuElement, ServerFormModel};
+use semantic_input::{KeyboardKey, ScrollUnit};
+use ui::{ChatClipboard, UiPoint};
+
+use super::engine_focus;
+use super::engine_scroll;
+use super::values::{FormEngineState, slider_fraction, slider_value_after_step, slider_value_at};
+use super::{FormValue, LocalFormAction};
+use crate::ui_runtime::{PlatformClipboard, UiRuntime, interaction::is_chat_edit_shortcut};
+use ui_engine::frame::EngineFrame;
+
+/// Longest paste a screen outside the engine's edit boxes accepts through [`typed_text`].
+const MAX_PASTE_BYTES: usize = 4096;
+/// The most UTF-8 bytes one character takes.
+const MAX_UTF8_BYTES_PER_CHAR: usize = 4;
+/// Animation end events one input frame relays at most.
+const MAX_END_EVENTS: usize = 64;
+/// The input button a primary pointer press is.
+const SELECT: &str = "button.menu_select";
+
+#[cfg(test)]
+mod paste_tests;
+#[cfg(test)]
+mod tests;
+
+/// The primary pointer button's edges this frame and whether it is down.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PointerButtons {
+    pub pressed: bool,
+    pub released: bool,
+    pub held: bool,
+}
+
+/// One frame of raw input for the engine path.
+pub struct EngineInput<'a> {
+    pub cursor: Option<UiPoint>,
+    /// Keys held this frame.
+    pub keys: &'a [KeyboardKey],
+    pub pointer: PointerButtons,
+    /// A touch interacts on release; mouse and controller input retain their own edges.
+    pub touch: bool,
+    pub pointer_edges: Vec<bool>,
+    pub wheel: Vec<(f32, ScrollUnit)>,
+    /// Pressed keys this frame with their produced text.
+    /// Key presses with their text and whether the OS auto-repeated them.
+    pub typed: Vec<(KeyboardKey, Option<String>, bool)>,
+    /// Whether edit shortcut modifiers were down as each press in `typed` arrived, for a caller
+    /// that knows. A press past its end uses `keys`, the state the frame ended with.
+    pub press_shortcuts: Vec<bool>,
+    /// The key bound to Menu Cancel, which raises the form's cancel button like Escape.
+    pub menu_cancel: Option<KeyboardKey>,
+    /// Seconds on the app clock.
+    pub now: f64,
+    /// The form's animator: button events play and reset its animations.
+    pub animator: Option<std::sync::MutexGuard<'a, json_ui::Animator>>,
+}
+
+/// One input frame's screen events, with what each pointer release answers for.
+#[derive(Debug, Default)]
+pub struct DispatchedInput {
+    pub events: Vec<ScreenEvent>,
+    /// The event range a release raised and the control its press went down on.
+    releases: Vec<(std::ops::Range<usize>, Option<String>)>,
+}
+
+impl DispatchedInput {
+    /// The control the pointer press behind the event at `index` went down on.
+    pub fn pressed_at(&self, index: usize) -> Option<&str> {
+        self.releases
+            .iter()
+            .find(|(range, _)| range.contains(&index))
+            .and_then(|(_, pressed)| pressed.as_deref())
+    }
+}
+
+/// Whether `button` activates its control: a pointer press answers on release over the control it
+/// went down on (`pressed`), any other input on its down edge.
+pub fn activates(button: &ButtonEvent, pressed: Option<&str>) -> bool {
+    if button.from == SELECT {
+        !button.down && pressed == Some(button.key.as_str())
+    } else {
+        button.down && button.interacted
+    }
+}
+
+/// Dispatches one captured frame through the retained form controller.
+pub fn drive(runtime: &mut UiRuntime, frame: &EngineFrame, input: EngineInput<'_>) {
+    let Some(entry) = runtime.server_forms().active() else {
+        return;
+    };
+    let identity = entry.identity;
+    let model = entry.model.clone();
+    let now = input.now;
+    // Controls `destroy_at_end` removed take no input.
+    let survivors = input.animator.as_ref().and_then(|animator| {
+        frame
+            .hits
+            .iter()
+            .any(|hit| animator.is_destroyed(&hit.key))
+            .then(|| EngineFrame {
+                hits: frame
+                    .hits
+                    .iter()
+                    .filter(|hit| !animator.is_destroyed(&hit.key))
+                    .cloned()
+                    .collect(),
+                ..frame.clone()
+            })
+    });
+    let frame = survivors.as_ref().unwrap_or(frame);
+    let dispatched = dispatch(runtime.server_forms_mut().engine_mut(), frame, input);
+    let mut action = None;
+    for (at, event) in dispatched.events.iter().enumerate() {
+        if let Some(found) = controller(runtime, frame, &model, event, dispatched.pressed_at(at)) {
+            action = Some(found);
+        }
+    }
+    if let Some(action) = action {
+        let now_millis = if now.is_finite() && now.is_sign_positive() {
+            (now * 1_000.0).min(u64::MAX as f64) as u64
+        } else {
+            0
+        };
+        let _ = runtime.respond_to_server_form_at(identity, action, now_millis);
+    }
+}
+
+/// Routes one frame of raw input through the screen's dispatcher: pointer and scroll, then each
+/// press and release, then keys, as vanilla's input buttons reach a screen's components.
+pub fn dispatch(
+    engine: &mut FormEngineState,
+    frame: &EngineFrame,
+    mut input: EngineInput<'_>,
+) -> DispatchedInput {
+    let point = input.cursor.map(|cursor| frame.to_virtual(cursor));
+    let control = is_chat_edit_shortcut(input.keys);
+    let mut events = Vec::new();
+    let delta = (input.now - engine.clock).max(0.0);
+    engine.clock = input.now;
+    engine.dispatcher.tick(&frame.hits, &mut engine.view, delta);
+    let pointer = PointerInput {
+        point,
+        held: input.pointer.held,
+        mode: if input.touch {
+            InputMode::Touch
+        } else {
+            InputMode::Mouse
+        },
+        now: input.now,
+    };
+    events.extend(
+        engine
+            .dispatcher
+            .pointer(&frame.hits, &mut engine.view, pointer)
+            .events,
+    );
+    // Keyboard focus shows as hover while the pointer rests on nothing.
+    if engine.view.hovered.is_none() {
+        engine.view.hovered = engine.view.focused.clone();
+    }
+    engine_scroll::step(engine, frame);
+    let edges = if input.pointer_edges.is_empty() {
+        [
+            input.pointer.pressed.then_some(true),
+            input.pointer.released.then_some(false),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    } else {
+        std::mem::take(&mut input.pointer_edges)
+    };
+    if input.touch && point.is_none() && edges.contains(&false) {
+        engine.cancel_pointer_input();
+        return DispatchedInput::default();
+    }
+    // Vanilla sends pointer deltas to active components; a scroll view
+    // consumes them while capture is still down.
+    // Move the existing capture once before any release, even when the final state is up.
+    if let Some(point) = point
+        && (input.pointer.held || edges.contains(&false))
+    {
+        engine_scroll::drag(engine, frame, point);
+    }
+    // Each release answers only for the control its press went down on.
+    let mut releases = Vec::new();
+    for down in edges {
+        if down {
+            if let Some(point) = point {
+                let region = hit_test(&frame.hits, point);
+                engine_scroll::press(engine, frame, region, point);
+                events.extend(
+                    pointer_button(engine, frame, true, Some(point), input.now, input.touch).events,
+                );
+            }
+        } else {
+            engine.drag = None;
+            // A touch pan past the tap slop presses nothing.
+            let tapped = engine_scroll::release(engine);
+            if input.touch && !tapped {
+                engine.clear_pointer_activation();
+                continue;
+            }
+            let pressed = engine.view.pressed.clone().filter(|_| tapped);
+            let up = pointer_button(engine, frame, false, point, input.now, input.touch).events;
+            releases.push((events.len()..events.len() + up.len(), pressed));
+            events.extend(up);
+        }
+    }
+    if let Some(point) = point
+        && !input.wheel.is_empty()
+    {
+        engine_scroll::wheel(engine, frame, point, &input.wheel);
+    }
+    for (index, (key, text, repeat)) in input.typed.into_iter().enumerate() {
+        let control = input.press_shortcuts.get(index).copied().unwrap_or(control);
+        let editing = editing(engine, frame);
+        // Held keys repeat text into an edit box, but never re-press a control.
+        if repeat && !editing {
+            continue;
+        }
+        let key = menu_cancel_as_escape(key, input.menu_cancel, editing);
+        events.extend(keyboard(
+            engine,
+            frame,
+            key,
+            text.as_deref(),
+            control,
+            input.now,
+            &mut PlatformClipboard,
+        ));
+    }
+    if let Some(animator) = input.animator.as_mut() {
+        animate(animator, &mut events);
+    }
+    DispatchedInput { events, releases }
+}
+
+/// Fire each button event into the animator; its `end_event`s come back as
+/// button events the controller and other animations receive.
+fn animate(animator: &mut json_ui::Animator, events: &mut Vec<ScreenEvent>) {
+    // Ends that start animations ending at once must not feed back forever.
+    let cap = events.len() + MAX_END_EVENTS;
+    append_animation_ends(animator, events, cap);
+    let mut at = 0;
+    while at < events.len() {
+        if let ScreenEvent::Button(button) = &events[at]
+            && button.down
+        {
+            animator.fire(&button.id);
+        }
+        append_animation_ends(animator, events, cap);
+        at += 1;
+    }
+}
+
+/// Relays pending end events even when this frame has no physical input.
+fn append_animation_ends(
+    animator: &mut json_ui::Animator,
+    events: &mut Vec<ScreenEvent>,
+    cap: usize,
+) {
+    for ended in animator.take_events() {
+        if let json_ui::AnimEvent::End(id) = ended
+            && events.len() < cap
+        {
+            events.push(ScreenEvent::Button(ButtonEvent {
+                id,
+                from: String::new(),
+                key: String::new(),
+                collection_index: None,
+                collection: None,
+                down: true,
+                interacted: true,
+                scope: json_ui::MappingScope::Controller,
+            }));
+        }
+    }
+}
+
+/// One input button edge through the dispatcher.
+fn button(
+    engine: &mut FormEngineState,
+    frame: &EngineFrame,
+    id: &str,
+    down: bool,
+    point: Option<[f64; 2]>,
+    now: f64,
+) -> Dispatch {
+    let input = EngineButton {
+        id,
+        down,
+        point,
+        mode: InputMode::Mouse,
+        now,
+    };
+    engine
+        .dispatcher
+        .button(&frame.hits, &mut engine.view, input)
+}
+
+/// Dispatches a pointer edge with its original device, so touch controls activate on release.
+fn pointer_button(
+    engine: &mut FormEngineState,
+    frame: &EngineFrame,
+    down: bool,
+    point: Option<[f64; 2]>,
+    now: f64,
+    touch: bool,
+) -> Dispatch {
+    engine.dispatcher.button(
+        &frame.hits,
+        &mut engine.view,
+        EngineButton {
+            id: SELECT,
+            down,
+            point,
+            now,
+            mode: if touch {
+                InputMode::Touch
+            } else {
+                InputMode::Mouse
+            },
+        },
+    )
+}
+
+/// The key a press raises: the Menu Cancel key acts as Escape unless a selected edit box owns
+/// typed keys, where it keeps its own typing, deletion and paste.
+fn menu_cancel_as_escape(
+    key: KeyboardKey,
+    menu_cancel: Option<KeyboardKey>,
+    editing: bool,
+) -> KeyboardKey {
+    if !editing && menu_cancel == Some(key) {
+        KeyboardKey::Escape
+    } else {
+        key
+    }
+}
+
+/// Whether the selected component is an edit box taking typed text.
+fn editing(engine: &FormEngineState, frame: &EngineFrame) -> bool {
+    engine
+        .view
+        .components
+        .selected()
+        .is_some_and(|key| edit_region(frame, key).is_some())
+}
+
+/// Bytes a paste into the selected edit box may take. More bytes than this are more characters
+/// than the box holds, and a box rejects text that doesn't fit whole.
+fn selected_paste_allowance(engine: &FormEngineState, frame: &EngineFrame) -> usize {
+    engine
+        .view
+        .components
+        .selected()
+        .and_then(|key| edit_region(frame, key))
+        .and_then(|region| region.widget.edit.as_ref())
+        .and_then(|edit| usize::try_from(edit.max_length).ok())
+        .unwrap_or(0)
+        .saturating_mul(MAX_UTF8_BYTES_PER_CHAR)
+}
+
+/// A key as the input buttons vanilla's keyboard mapping raises, or typed text
+/// for the selected edit box, with Ctrl+V reading `clipboard`.
+fn keyboard<C: ChatClipboard>(
+    engine: &mut FormEngineState,
+    frame: &EngineFrame,
+    key: KeyboardKey,
+    text: Option<&str>,
+    control: bool,
+    now: f64,
+    clipboard: &mut C,
+) -> Vec<ScreenEvent> {
+    let typed = editing(engine, frame)
+        .then(|| {
+            let allowance = selected_paste_allowance(engine, frame);
+            typed_text_from(key, text, control, allowance, clipboard)
+        })
+        .flatten();
+    if let Some(typed) = typed {
+        return engine
+            .dispatcher
+            .text(&frame.hits, &mut engine.view, &typed, None)
+            .events;
+    }
+    let id = match key {
+        KeyboardKey::Escape => "button.menu_cancel",
+        KeyboardKey::Enter | KeyboardKey::NumpadEnter | KeyboardKey::Space => "button.menu_ok",
+        KeyboardKey::ArrowUp => "button.menu_up",
+        KeyboardKey::ArrowDown => "button.menu_down",
+        KeyboardKey::ArrowLeft => "button.menu_left",
+        KeyboardKey::ArrowRight => "button.menu_right",
+        KeyboardKey::Tab => {
+            engine_focus::tab(engine, frame);
+            return Vec::new();
+        }
+        _ => return Vec::new(),
+    };
+    let down = button(engine, frame, id, true, None, now);
+    let consumed = down.consumed;
+    let mut events = down.events;
+    events.extend(button(engine, frame, id, false, None, now).events);
+    // Content subtrees omit the screen's global cancel mapping.
+    if !consumed && key == KeyboardKey::Escape
+        && let Some(target) = &frame.cancel_target
+        && !events.iter().any(|event| matches!(event, ScreenEvent::Button(button) if button.id == *target && button.down && button.interacted))
+    {
+        events.push(ScreenEvent::Button(ButtonEvent {
+            id: target.clone(),
+            from: id.to_owned(),
+            key: String::new(),
+            collection_index: None,
+            collection: None,
+            down: true,
+            interacted: true,
+            scope: json_ui::MappingScope::Global,
+        }));
+    }
+    // An unconsumed direction moves focus.
+    if !consumed && let Some(direction) = engine_focus::direction_of(key) {
+        engine_focus::step(engine, frame, direction);
+    }
+    events
+}
+
+/// What a key press types into a selected edit box, as vanilla's edit box takes it: Backspace
+/// and Enter as their control characters, Ctrl+V the clipboard, anything else its text without
+/// control characters.
+pub fn typed_text(key: KeyboardKey, text: Option<&str>, control: bool) -> Option<String> {
+    typed_text_from(key, text, control, MAX_PASTE_BYTES, &mut PlatformClipboard)
+}
+
+/// [`typed_text`] with the clipboard it pastes from and the most bytes it pastes; a longer
+/// clipboard pastes nothing.
+fn typed_text_from<C: ChatClipboard>(
+    key: KeyboardKey,
+    text: Option<&str>,
+    control: bool,
+    paste_allowance: usize,
+    clipboard: &mut C,
+) -> Option<String> {
+    match key {
+        KeyboardKey::Backspace => Some("\u{8}".to_owned()),
+        KeyboardKey::Enter | KeyboardKey::NumpadEnter => Some("\r".to_owned()),
+        KeyboardKey::KeyV if control => clipboard
+            .read_text_bounded(paste_allowance)
+            .ok()
+            .flatten()
+            .map(|text| text.to_string()),
+        _ if !control => text
+            .filter(|text| !text.chars().any(char::is_control))
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
+/// The form's screen controller: what each screen event does to its values.
+fn controller(
+    runtime: &mut UiRuntime,
+    frame: &EngineFrame,
+    model: &ServerFormModel,
+    event: &ScreenEvent,
+    pressed: Option<&str>,
+) -> Option<LocalFormAction> {
+    match event {
+        ScreenEvent::Button(button) => {
+            let answers = activates(button, pressed);
+            if button.id == "button.dropdown_exit" && button.down {
+                close_dropdown(runtime, frame, custom_parent(frame, &button.key));
+            }
+            let action = answers.then(|| mapped_action(model, button)).flatten();
+            if let Some(action) = &action {
+                // Names the input that answered, for diagnosing unintended answers.
+                tracing::info!(
+                    target: "server_form",
+                    id = %button.id,
+                    from = %button.from,
+                    key = %button.key,
+                    index = ?button.collection_index,
+                    ?action,
+                    "form answered"
+                );
+            }
+            action
+        }
+        ScreenEvent::Toggle {
+            name,
+            key,
+            index,
+            checked,
+            ..
+        } => {
+            let index = (*index)?;
+            let engine = runtime.server_forms_mut().engine_mut();
+            let dropdown = frame
+                .hits
+                .iter()
+                .any(|region| region.key == *key && region.kind == HitKind::Dropdown);
+            if name == "custom_multiselect" {
+                if *checked {
+                    engine.open_multiselects.insert(index);
+                } else {
+                    engine.open_multiselects.remove(&index);
+                }
+            } else if name == "custom_multiselect_checkbox" {
+                let parent = custom_parent(frame, key)?;
+                if let Some(FormValue::MultiSelect(selected)) = engine.values.get_mut(parent) {
+                    let ServerFormModel::Custom(form) = model else {
+                        return None;
+                    };
+                    let Some(CustomFormElement::MultiSelect { options, .. }) =
+                        form.elements.get(parent)
+                    else {
+                        return None;
+                    };
+                    if index >= options.len() {
+                        return None;
+                    }
+                    let option = index as i32;
+                    if *checked && !selected.contains(&option) {
+                        selected.push(option);
+                    } else if !*checked {
+                        selected.retain(|value| *value != option);
+                    }
+                    selected.retain(|value| *value >= 0 && (*value as usize) < options.len());
+                    selected.sort_unstable();
+                    selected.dedup();
+                }
+            } else if dropdown {
+                if *checked {
+                    engine.open_dropdowns.insert(index);
+                } else {
+                    engine.open_dropdowns.remove(&index);
+                }
+            } else if name == "custom_dropdown_radio_toggle" {
+                if !*checked {
+                    return None;
+                }
+                let parent = custom_parent(frame, key)?;
+                let ServerFormModel::Custom(form) = model else {
+                    return None;
+                };
+                let Some(CustomFormElement::Dropdown { options, .. }) = form.elements.get(parent)
+                else {
+                    return None;
+                };
+                if index < options.len()
+                    && let Some(value) = engine.values.get_mut(parent)
+                {
+                    *value = FormValue::Dropdown(index as i32);
+                    close_dropdown(runtime, frame, Some(parent));
+                }
+            } else if let Some(FormValue::Toggle(on)) = engine.values.get_mut(index) {
+                *on = *checked;
+            }
+            None
+        }
+        ScreenEvent::Slider {
+            index,
+            value,
+            step,
+            directional,
+            key,
+            ..
+        } => {
+            if let Some(position) =
+                set_slider(runtime, model, (*index)?, *value, *step, *directional)
+            {
+                runtime
+                    .server_forms_mut()
+                    .engine_mut()
+                    .view
+                    .components
+                    .set_slider_value(key, position);
+            }
+            None
+        }
+        ScreenEvent::TextEdit { index, text, .. } => {
+            let engine = runtime.server_forms_mut().engine_mut();
+            if let Some(FormValue::Text(value)) =
+                index.and_then(|index| engine.values.get_mut(index))
+            {
+                value.clone_from(text);
+            }
+            None
+        }
+        ScreenEvent::Sound {
+            name,
+            volume,
+            pitch,
+        } => {
+            crate::sound_requests::ui_sound(name, *volume, *pitch);
+            None
+        }
+        ScreenEvent::TextEditSelected { .. } => None,
+    }
+}
+
+/// A button id (from a press or a `global` mapping) as a form answer.
+fn mapped_action(model: &ServerFormModel, button: &ButtonEvent) -> Option<LocalFormAction> {
+    let index = button.collection_index;
+    match button.id.as_str() {
+        "button.form_button_click" => {
+            let index = index?;
+            let ordinal = match model {
+                // Decorations share the collection; answers count buttons only.
+                ServerFormModel::ElementMenu(menu) => menu.elements
+                    [..index.min(menu.elements.len())]
+                    .iter()
+                    .filter(|element| matches!(element, MenuElement::Button { .. }))
+                    .count(),
+                _ => index,
+            };
+            Some(LocalFormAction::SubmitButton(ordinal as u32))
+        }
+        "button.submit_custom_form" => Some(LocalFormAction::CustomElements),
+        // NPC dialogue: a student button answers its action, exiting closes.
+        "button.student_button" => Some(LocalFormAction::SubmitButton(index? as u32)),
+        "button.exit_student" => Some(LocalFormAction::Dismiss),
+        "popup_dialog.left_button" => Some(LocalFormAction::SubmitButton(0)),
+        "popup_dialog.rightcancel_button" => Some(LocalFormAction::SubmitButton(1)),
+        "button.menu_exit" | "popup_dialog.escape" => Some(LocalFormAction::Dismiss),
+        _ => None,
+    }
+}
+
+/// Finds the owning custom control, including for an option in its nested collection.
+fn custom_parent(frame: &EngineFrame, key: &str) -> Option<usize> {
+    frame
+        .hits
+        .iter()
+        .find(|region| region.key == key)?
+        .collections
+        .iter()
+        .find(|(name, _)| name == "custom_form")
+        .map(|(_, index)| *index)
+}
+
+/// Closes one dropdown, or every dropdown for an unscoped screen exit.
+fn close_dropdown(runtime: &mut UiRuntime, frame: &EngineFrame, parent: Option<usize>) {
+    let engine = runtime.server_forms_mut().engine_mut();
+    if let Some(parent) = parent {
+        engine.open_dropdowns.remove(&parent);
+    } else {
+        engine.open_dropdowns.clear();
+    }
+    for region in frame.hits.iter().filter(|region| {
+        region.kind == HitKind::Dropdown
+            && parent
+                .is_none_or(|parent| region.collections.contains(&("custom_form".into(), parent)))
+    }) {
+        engine.view.components.forget(&region.key);
+    }
+}
+
+fn edit_region<'a>(frame: &'a EngineFrame, key: &str) -> Option<&'a HitRegion> {
+    frame
+        .hits
+        .iter()
+        .find(|region| region.key == key && region.kind == HitKind::EditBox)
+}
+
+/// Snaps the element value and returns the track position for subsequent input.
+fn set_slider(
+    runtime: &mut UiRuntime,
+    model: &ServerFormModel,
+    index: usize,
+    value: f64,
+    step: Option<usize>,
+    directional: bool,
+) -> Option<f64> {
+    let ServerFormModel::Custom(form) = model else {
+        return None;
+    };
+    let engine = runtime.server_forms_mut().engine_mut();
+    let (value, position) = match form.elements.get(index) {
+        Some(CustomFormElement::Slider {
+            min,
+            max,
+            step: size,
+            ..
+        }) => {
+            let previous_position = engine.position_sliders.remove(&index);
+            if !directional {
+                engine.position_sliders.insert(index);
+            }
+            let Some(FormValue::Slider(current)) = engine.values.get(index) else {
+                return None;
+            };
+            let current = if !directional || previous_position {
+                slider_value_at(min.get(), max.get(), size.get(), value)
+            } else {
+                slider_value_after_step(min.get(), max.get(), size.get(), value, *current)
+            };
+            (
+                FormValue::Slider(current),
+                slider_fraction(min.get(), max.get(), current),
+            )
+        }
+        Some(CustomFormElement::StepSlider { steps, .. }) if !steps.is_empty() => {
+            let index = step.unwrap_or(value.max(0.0) as usize).min(steps.len() - 1) as i32;
+            (FormValue::Step(index), f64::from(index))
+        }
+        _ => return None,
+    };
+    *engine.values.get_mut(index)? = value;
+    Some(position)
+}

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Umbra Client
+Comment=Umbra Client for Minecraft Bedrock
+Exec=umbra
+Icon=umbra
+Categories=Game;
+Terminal=false

@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "family": "Inter",
+  "style": "Regular",
+  "license": "OFL-1.1",
+  "copyright": "Copyright (c) 2016 The Inter Project Authors (https://github.com/rsms/inter)",
+  "repository": "https://github.com/rsms/inter",
+  "commit": "e3a3d4c57d5ecc01453a575621882a384c1995a3",
+  "font_file": "InterVariable.ttf",
+  "font_size_bytes": 879708,
+  "font_sha256": "4989b125924991b90d05b2d16e0e388c48f7d5bb8b30539bbf9c755278d0ccaf",
+  "rasterization": {
+    "pixel_height": 18,
+    "atlas_side": 1024,
+    "replacement_codepoint": 65533,
+    "proportional_advance_gap_px": 2,
+    "blank_advance_px": 8
+  }
+}

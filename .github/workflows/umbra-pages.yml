@@ -1,0 +1,43 @@
+name: Umbra website
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "web/site/umbra.html"
+      - "web/site/build-landing.mjs"
+      - "packaging/release-assets.json"
+      - "assets/branding/client-badge.png"
+      - "assets/branding/title.png"
+      - ".github/workflows/umbra-pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: umbra-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    if: github.repository != 'cinnabar-mc/cinnabar'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - name: Build landing page
+        run: node web/site/build-landing.mjs --output _site --repository "$GITHUB_REPOSITORY"
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

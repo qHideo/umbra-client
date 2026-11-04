@@ -1,0 +1,6 @@
+umbra cinnabar CLIENT
+umbra-updater update-installer UPDATER
+bedrock-core - CORE
+bedrock-local-server - LOCAL_SERVER
+umbra-cxb cinnabar-cxb CXB
+shaderpack-worker shaderpack-worker SHADERPACK_WORKER

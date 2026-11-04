@@ -1,0 +1,283 @@
+//! Guest SDK for player mods, generated from the same `extension` WIT contract used by the host.
+//! A server Experience's client part uses `experience-sdk`'s `client` feature instead.
+
+/// Maximum explicit block destruction requests committed by one mod per frame.
+pub const MAX_BLOCK_BREAKS: usize = 1024;
+/// Maximum distance of an explicit destruction request from the observed eye, in blocks.
+pub const MAX_BLOCK_BREAK_DISTANCE: f32 = 16.;
+
+mod terrain_limits;
+pub use terrain_limits::{
+    MAX_TERRAIN_BOXES, MAX_TERRAIN_CELLS, MAX_TERRAIN_DISTANCE, MAX_TERRAIN_EXTENT,
+    MAX_TERRAIN_FRAME_CELLS, MAX_TERRAIN_METADATA_BYTES, MAX_TERRAIN_QUERIES,
+    MAX_TERRAIN_RESPONSE_BYTES,
+};
+
+mod guest;
+mod input;
+pub use input::{
+    MAX_CONTROL_KEY_BYTES, MAX_CONTROL_KEYS, MAX_INPUT_ACTION_BYTES, MAX_INPUT_BINDINGS,
+    MAX_INPUT_BINDINGS_PER_READ, control_key_valid,
+};
+pub mod native_camera;
+pub mod native_frame;
+pub mod native_render;
+pub mod panel_input;
+
+/// Converts observed actor YXZ degrees (forward -Z, pitch up) to Bedrock view degrees.
+pub fn bedrock_view_angles(yaw: f32, pitch: f32) -> [f32; 2] {
+    [(180. - yaw).rem_euclid(360.), -pitch]
+}
+
+pub use guest::PlayerMod;
+
+/// Maximum new sound requests offered to sound handlers in one audio frame.
+pub const MAX_HANDLED_SOUNDS: usize = 256;
+/// Guest fuel shared by all sound handlers in one audio frame.
+pub const TOTAL_SOUND_HANDLER_FUEL: u64 = 400_000;
+/// Maximum bytes in one handled sound definition name.
+pub const MAX_SOUND_NAME_BYTES: usize = 128;
+/// Guest fuel shared by all teleport handlers in one frame.
+pub const TOTAL_TELEPORT_HANDLER_FUEL: u64 = 400_000;
+/// Guest fuel for one synchronous action-filter call, independent of frame callbacks.
+pub const ACTION_FILTER_FUEL: u64 = 200_000;
+/// Guest fuel for one event-handler call; a handler is skipped when its event family's
+/// remaining shared allowance is smaller.
+pub const HANDLER_CALL_FUEL: u64 = 50_000;
+/// Selected-slot reads one callback may make, apart from the player-state read allowance.
+pub const MAX_SELECTED_SLOT_READS: u32 = 8;
+
+/// Native tick rate used when recording elapsed playtime; the app checks the simulation clock.
+pub const BEDROCK_TICKS_PER_SECOND: u32 = 20;
+
+/// Exclusive bound for guest time overrides: ticks in one Bedrock day.
+pub const BEDROCK_DAY_TICKS: u32 = 24_000;
+/// Maximum remote players exposed by one local gameplay snapshot.
+pub const MAX_GAMEPLAY_PLAYERS: usize = 128;
+/// Fixed player inventory and worn armor lengths in local player-state snapshots.
+pub const PLAYER_STATE_INVENTORY_SLOTS: usize = 36;
+pub const PLAYER_STATE_ARMOR_SLOTS: usize = 4;
+/// Bounds for read-only local player-state payloads.
+pub const MAX_PLAYER_STATE_EFFECTS: usize = 32;
+pub const MAX_ITEM_IDENTIFIER_BYTES: usize = 128;
+/// Maximum accumulated camera change per axis in one callback, in radians.
+pub const MAX_CAMERA_DELTA_RADIANS: f32 = 0.25;
+/// Personal attack overrides never extend actor selection beyond this local bound.
+pub const MAX_ENTITY_REACH_BLOCKS: f32 = 6.0;
+/// Maximum opt-in delay of post-login application packets in either direction.
+pub const MAX_PACKET_DELAY_MS: u32 = 1_000;
+/// Bounded serialized personal settings.
+pub const MAX_SETTINGS_BYTES: usize = 16 * 1024;
+/// Inventory requests one player-mod callback may make.
+pub const MAX_INVENTORY_REQUESTS: usize = 4;
+/// Optional top-level component data containing one existing personal panel bundle.
+pub const PANEL_BUNDLE_SECTION: &str = "cinnabar:extension/panel-bundle@1";
+/// Optional top-level component data containing one outline font for the personal panel.
+pub const PANEL_FONT_SECTION: &str = "cinnabar:extension/font@1";
+/// Maximum source bytes in an embedded or explicitly selected personal panel font.
+pub const MAX_PANEL_FONT_BYTES: usize = 2 * 1024 * 1024;
+/// Nominal outline-font em size in personal-panel GUI coordinates.
+pub const PANEL_FONT_EM_GUI_PIXELS: f32 = 9.0;
+/// First private-use character reserved for optional personal-panel icon glyphs.
+pub const PANEL_ICON_GLYPH_START: u32 = 0xE800;
+/// Maximum number of dense icon glyphs in one personal-panel font.
+pub const MAX_PANEL_ICON_GLYPHS: u32 = 64;
+/// Optional top-level PNG data replacing the local main-menu logo.
+pub const MENU_LOGO_SECTION: &str = "cinnabar:extension/menu-logo@1";
+/// Optional top-level UTF-8 text replacing the local menu's product heading.
+pub const MENU_TITLE_SECTION: &str = "cinnabar:extension/menu-title@1";
+/// Optional top-level UTF-8 copyright and license notices, retained outside executable bytes.
+pub const NOTICES_SECTION: &str = "cinnabar:extension/notices@1";
+/// Bounded static menu-logo source and decoded image geometry.
+pub const MAX_MENU_LOGO_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_MENU_LOGO_WIDTH: u32 = 4096;
+pub const MAX_MENU_LOGO_HEIGHT: u32 = 2048;
+pub const MAX_MENU_LOGO_PIXELS: u64 = 4 * 1024 * 1024;
+/// A menu heading is one bounded, nonempty line of UTF-8 text.
+pub const MAX_MENU_TITLE_BYTES: usize = 64;
+/// Retained license text has its own static source budget.
+pub const MAX_NOTICES_BYTES: usize = 4 * 1024 * 1024;
+/// Optional top-level PNG shown beside the component in the Mods library.
+pub const ICON_SECTION: &str = "cinnabar:extension/icon@1";
+/// Optional top-level HTTPS GitHub repository URL enabling mod release notifications.
+pub const UPDATE_REPOSITORY_SECTION: &str = "cinnabar:extension/update-repository@1";
+/// Optional stable GitHub latest-release WASM URL enabling automatic mod installation.
+pub const UPDATE_URL_SECTION: &str = "cinnabar:extension/update-url@1";
+/// Supported mod API revisions, oldest to newest. Append a revision when adding
+/// capabilities; remove an older revision only when it is no longer supported.
+pub const COMPATIBILITY_REVISIONS_JSON: &str = include_str!("../compatibility-revisions.json");
+/// Optional JSON source, package and full mod revision for host-compatible update selection.
+pub const REVISION_UPDATE_SECTION: &str = "cinnabar:extension/revision-update@1";
+/// Bounded icon source and decoded side length; an icon outside them shows the placeholder.
+pub const MAX_ICON_BYTES: usize = 256 * 1024;
+pub const MAX_ICON_SIDE: u32 = 256;
+/// Every presentation asset section stripped from executable component bytes.
+pub const COMPONENT_ASSET_SECTIONS: [&str; 6] = [
+    PANEL_BUNDLE_SECTION,
+    PANEL_FONT_SECTION,
+    MENU_LOGO_SECTION,
+    MENU_TITLE_SECTION,
+    NOTICES_SECTION,
+    ICON_SECTION,
+];
+
+/// Maximum nearby mobs in one snapshot, and the radius they are drawn from.
+pub const MAX_GAMEPLAY_MOBS: usize = 64;
+pub const MAX_MOB_RANGE_BLOCKS: f32 = 64.0;
+pub const MAX_MOB_TYPE_BYTES: usize = 64;
+/// Camera rig bounds: |right| and up/down offset, boom length, |roll| and |FOV change|.
+pub const MAX_RIG_SIDE_BLOCKS: f32 = 2.0;
+pub const MAX_RIG_VERTICAL_BLOCKS: f32 = 2.0;
+pub const MAX_RIG_BACK_BLOCKS: f32 = 8.0;
+pub const MAX_RIG_ROLL_RADIANS: f32 = 0.6;
+pub const MAX_RIG_FOV_DELTA_DEGREES: f32 = 30.0;
+/// Largest absolute roll or pitch a current-frame view tilt adds, in degrees.
+pub const MAX_VIEW_TILT_DEGREES: f32 = 90.0;
+/// Lower bounds for current-frame FOV and routed look multipliers; their upper bound is 1.
+pub const MIN_VIEW_FOV_SCALE: f32 = 0.1;
+pub const MIN_VIEW_LOOK_SCALE: f32 = 0.05;
+/// Granted command names, their byte bound, and per-frame command requests.
+pub const MAX_COMMAND_GRANTS: usize = 8;
+pub const MAX_COMMAND_BYTES: usize = 128;
+pub const MAX_COMMANDS_PER_FRAME: usize = 4;
+/// Command requests accepted per second of gameplay frame time.
+pub const MAX_COMMANDS_PER_SECOND: usize = 10;
+/// Presentation cue bounds per frame.
+pub const MAX_CUES_PER_FRAME: usize = 16;
+pub const MAX_CUE_NAME_BYTES: usize = 32;
+pub const MAX_CUE_VALUES: usize = 8;
+/// Cues delivered to one callback from every loaded mod.
+pub const MAX_INCOMING_CUES: usize = 64;
+/// Structural bound on local mods running at once; frame fuel and memory budgets limit their cost.
+pub const MAX_LOADED_MODS: usize = 256;
+
+mod render_limits;
+pub use render_limits::{
+    MAX_PASS_COMPILES_PER_FRAME, MAX_PASS_NAME_BYTES, MAX_PASS_PARAMS, MAX_PRIMITIVE_COORDINATE,
+    MAX_PRIMITIVE_EXTENT_BLOCKS, MAX_RENDER_BEAMS, MAX_RENDER_BILLBOARDS, MAX_RENDER_CALLS,
+    MAX_RENDER_DECALS, MAX_RENDER_PASSES, MAX_RENDER_RIBBONS, MAX_RIBBON_POINTS, MAX_SHADER_BYTES,
+    MAX_SHADER_EXPRESSIONS, MAX_SHADER_TEXTURE_SAMPLES, MAX_SHADER_TYPE_BYTES,
+    MAX_STATEMENT_TOKENS,
+};
+
+/// Most full-block highlights one native render scene draws.
+pub const MAX_BLOCK_HIGHLIGHTS: usize = 1024;
+/// Most positions one `terrain.find-blocks` call returns, nearest first; it matches the
+/// highlight capacity so one search can fill a scene.
+pub const MAX_FOUND_BLOCKS: usize = MAX_BLOCK_HIGHLIGHTS;
+/// Most block identifiers one `terrain.find-blocks` search matches.
+pub const MAX_FOUND_BLOCK_IDENTIFIERS: usize = 8;
+/// Longest namespaced block identifier a block search accepts.
+pub const MAX_BLOCK_IDENTIFIER_BYTES: usize = 128;
+
+/// The `extension` world: HUD label, input, visual time, gameplay, panel, settings, events and
+/// render. The package also defines `player-mod`, whose types and links reach other packages.
+pub mod bindings {
+    wit_bindgen::generate!({
+        path: [
+            "../experience-sdk/wit/client/deps/server-experience",
+            "../experience-sdk/wit/session",
+            "wit",
+        ],
+        world: "cinnabar:extension/extension@0.1.0",
+        generate_all,
+        pub_export_macro: true,
+    });
+}
+
+/// The `player-mod` world: `extension` plus screens beside the container screens, the
+/// session's items and recipes, declared keys and event callbacks.
+pub mod player_mod;
+
+/// Explicit opt-in player-mod bindings; ordinary SDK exports do not claim input filtering.
+pub mod filtered_player_mod;
+
+/// The action filter and every event handler, with ordinary frame and UI callbacks.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Canonical ABI flattens screen records"
+)]
+pub mod handled_player_mod;
+
+/// The `packet-mod` world: a trusted mod that relays every session packet.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "wit-bindgen flattens the start identity into canonical ABI parameters"
+)]
+pub mod packet_mod {
+    wit_bindgen::generate!({
+        path: [
+            "../experience-sdk/wit/client/deps/server-experience",
+            "../experience-sdk/wit/session",
+            "wit",
+        ],
+        world: "cinnabar:extension/packet-mod@0.1.0",
+        pub_export_macro: true,
+        export_macro_name: "export_packet_mod",
+    });
+}
+
+mod observations;
+pub use observations::{
+    MAX_ACTOR_LIFE_READS, MAX_COMBAT_LIFE_READS, MAX_COMBAT_READ_EVENTS, MAX_OBSERVED_ACTOR_BOXES,
+    MAX_OBSERVED_ACTOR_NAME_BYTES, MAX_OBSERVED_ACTORS, MAX_OBSERVED_COMBAT_EVENTS,
+    MAX_WORLD_IDENTITY_BYTES,
+};
+
+/// Limits of the `presentation` interface.
+pub mod presentation;
+
+/// Most `facts` reads one callback may make, separate from player-state reads. Enough to resolve
+/// every inventory, armour and offhand item and every status effect in one callback; one more
+/// read traps the callback.
+pub const MAX_FACT_READS: u32 = 128;
+const _: () = assert!(
+    MAX_FACT_READS as usize
+        >= PLAYER_STATE_INVENTORY_SLOTS + PLAYER_STATE_ARMOR_SLOTS + 1 + MAX_PLAYER_STATE_EFFECTS
+);
+pub mod facts;
+
+/// Frame fuel all local mods share, including actual world-entry use. Excess world-entry
+/// use reduces later frames' capacity. Two of mod-host's measured `FRAME_FUEL`.
+pub const TOTAL_MOD_FRAME_FUEL: u64 = 2_000_000;
+
+#[cfg(test)]
+mod fuel_tests;
+
+/// World drawing authority and generation-safe resource tokens.
+pub mod drawing;
+
+/// Retained drawing budgets per owner; aggregate capacity is reserved for every loaded mod.
+pub const MAX_DRAW_INSTANCES: usize = 1024;
+pub const MAX_DRAW_GEOMETRIES: usize = 256;
+pub const MAX_DRAW_VERTICES: usize = 65_536;
+pub const MAX_DRAW_INDICES: usize = 196_608;
+pub const MAX_DRAW_GEOMETRY_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_DRAW_MUTATION_BYTES: usize = 1024 * 1024;
+pub const MAX_DRAW_GROUP_NAME_BYTES: usize = 32;
+
+/// Bounds host-expanded GPU topology independently of source vertex and index counts.
+pub const MAX_DRAW_EXPANDED_VERTICES: usize = MAX_DRAW_INDICES;
+
+/// Current actor observations and retained actor references, per drawing owner.
+pub const MAX_DRAW_ENTITIES: usize = MAX_OBSERVED_ACTORS;
+
+/// Caps submitted vertex work as well as resident mesh sizes, including repeated instances.
+pub const MAX_DRAW_VERTEX_WORK: usize = MAX_DRAW_EXPANDED_VERTICES * 4;
+
+/// Largest linear RGBA component admitted by retained unlit drawing.
+pub const MAX_DRAW_COLOR_COMPONENT: f32 = 1.0;
+
+/// Procedural drawing presets and the fixed material parameter contract.
+pub mod materials;
+/// Retained custom materials per owner, including renderer-retiring resources.
+pub const MAX_DRAW_MATERIALS: usize = 8;
+/// Custom material validation attempts per callback, including rejected sources.
+pub const MAX_MATERIAL_COMPILES_PER_CALLBACK: u32 = 1;
+/// New native material pipeline compilations across all mods in one render frame.
+pub const MAX_MATERIAL_PIPELINE_COMPILES_PER_FRAME: usize = 1;
+/// Material admission uses the same source and expression ceilings as post effects.
+pub const MAX_MATERIAL_SHADER_BYTES: usize = MAX_SHADER_BYTES;
+pub const MAX_MATERIAL_SHADER_EXPRESSIONS: u32 = MAX_SHADER_EXPRESSIONS;
+/// Largest linear emission component delivered to the world HDR pipeline.
+pub const MAX_MATERIAL_EMISSION: f32 = 16.0;

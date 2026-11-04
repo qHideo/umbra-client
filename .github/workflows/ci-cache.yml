@@ -1,0 +1,180 @@
+name: CI cache
+
+# Saves dev's Linux Rust and Go caches, the base every pull request restores from, and tests dev on
+# Linux so direct pushes that break it are flagged on the commit that did it. Windows and macOS
+# caches come from ci.yml's full runs on dev; this dispatches one when their inputs change.
+# Runs at most hourly, and only when dev has changed since the last run.
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+# Queue rather than cancel: a cancelled run saves nothing.
+concurrency:
+  group: ci-cache-${{ github.ref }}
+  cancel-in-progress: false
+
+# Must match ci.yml so compiler outputs can be reused.
+env:
+  # The build cache saves target/, so CI keeps intermediates there instead of the shared build-dir.
+  CARGO_BUILD_BUILD_DIR: "{workspace-root}/target"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  changed:
+    name: Check for new dev commits
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+      deps: ${{ steps.check.outputs.deps }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          last=$(gh api "repos/$REPO/actions/workflows/ci-cache.yml/runs?branch=dev&status=success&per_page=20" \
+            --jq "[.workflow_runs[] | select(.id != $RUN_ID)][0].head_sha // \"\"")
+          run=false deps=false
+          if [ "$EVENT" = workflow_dispatch ] || [ "$last" != "$SHA" ]; then run=true; fi
+          # Inputs to the Windows and macOS cache keys: lockfiles, toolchain and these workflows.
+          # An unknown or unreachable last commit counts as changed.
+          if [ "$run" = true ]; then
+            files=Cargo.lock
+            if [ -n "$last" ]; then
+              files=$(gh api --paginate "repos/$REPO/compare/$last...$SHA?per_page=100" --jq '.files[].filename') || files=Cargo.lock
+            fi
+            if grep -qE '^(Cargo\.lock|rust-toolchain\.toml|(.*/)?go\.(sum|work\.sum)|\.github/workflows/ci(-cache)?\.yml|\.github/actions/.*)$' <<<"$files"; then
+              deps=true
+            fi
+          fi
+          { echo "run=$run"; echo "deps=$deps"; } >> "$GITHUB_OUTPUT"
+
+  full:
+    name: Dispatch full CI on dev
+    needs: changed
+    if: needs.changed.outputs.deps == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+        run: |
+          # Dispatch uses the branch's current tip, which may have advanced since this warmer began.
+          sha=$(gh api "repos/$REPO/commits/$REF" --jq '.sha')
+          covered=$(gh api --paginate "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$sha&branch=$REF&per_page=100" \
+            --jq '[.workflow_runs[] | select(.event == "schedule" or .event == "workflow_dispatch")
+              | select(.conclusion == "success" or .status == "queued" or .status == "in_progress"
+                or .status == "requested" or .status == "waiting" or .status == "pending")] | length' \
+            | awk '{ total += $1 } END { print total + 0 }')
+          if [ "$covered" -eq 0 ]; then
+            gh workflow run ci.yml --repo "$REPO" --ref "$REF"
+          else
+            echo "Full CI already passed or is pending on $sha; skipping dispatch."
+          fi
+
+  linux:
+    permissions:
+      contents: read
+      actions: write
+    needs: changed
+    if: needs.changed.outputs.run == 'true'
+    name: Warm and test Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt, clippy
+      - name: Restore Rust build cache
+        id: rust-cache
+        uses: ./.github/actions/build-cache
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+          cache: false
+      - name: Restore Go build cache
+        id: go-cache
+        uses: ./.github/actions/build-cache
+        with:
+          language: go
+      - name: Warm Go caches
+        run: |
+          go build -trimpath -ldflags "$(bash packaging/common/core-ldflags.sh)" -o "$RUNNER_TEMP/bedrock-core" ./core/cmd/bedrock-core
+          go test -run '^$' ./core/...
+          go -C tools/registrygen test -run '^$' ./...
+          for module in chunkfix localserver bedsimtrace; do
+            GOWORK=off go -C "tools/$module" test -run '^$' ./...
+          done
+      - name: Install Linux desktop development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libwayland-dev libxkbcommon-dev libasound2-dev libudev-dev
+      # Everything ci.yml's preflight and verify jobs compile, so their dependencies are cached too.
+      # Cargo's messages name every unit these builds use, fresh ones included; the save leaves
+      # out the rest, and keeps every unit if any of these builds failed.
+      - run: cargo build -p architecture --locked --message-format json-render-diagnostics >> "$RUNNER_TEMP/cargo-units.jsonl"
+      - run: cargo build -p devtool --locked --message-format json-render-diagnostics >> "$RUNNER_TEMP/cargo-units.jsonl"
+      - continue-on-error: true
+        run: >-
+          cargo clippy --workspace --all-targets --locked --message-format json-render-diagnostics
+          -- -D warnings >> "$RUNNER_TEMP/cargo-units.jsonl"
+      - continue-on-error: true
+        run: |
+          {
+            cargo clippy -p render --features enhanced --all-targets --locked --message-format json-render-diagnostics -- -D warnings
+            cargo clippy -p cinnabar --features enhanced,developer-control,tracy --locked --message-format json-render-diagnostics -- -D warnings
+            cargo clippy -p cinnabar --features reports --tests --locked --message-format json-render-diagnostics -- -D warnings
+          } >> "$RUNNER_TEMP/cargo-units.jsonl"
+      - continue-on-error: true
+        run: >-
+          cargo test -p cinnabar --features developer-control --lib --locked --no-run
+          --message-format json-render-diagnostics >> "$RUNNER_TEMP/cargo-units.jsonl"
+      - name: Build Rust tests
+        id: build-tests
+        run: >-
+          cargo nextest run --workspace --locked --no-run
+          --cargo-message-format json-render-diagnostics >> "$RUNNER_TEMP/cargo-units.jsonl"
+      - name: Test Rust workspace
+        run: cargo nextest run --workspace --locked --no-fail-fast
+      - name: Test Rust doc examples
+        run: cargo test --doc --workspace --locked
+      - name: Save Rust build cache
+        if: ${{ !cancelled() && github.ref == 'refs/heads/dev' }}
+        continue-on-error: true
+        uses: ./.github/actions/build-cache
+        with:
+          phase: save
+          key: ${{ steps.rust-cache.outputs.key }}
+          bucket: ${{ steps.rust-cache.outputs.bucket }}
+          paths: ${{ steps.rust-cache.outputs.paths }}
+          cargo-messages: ${{ steps.build-tests.outcome == 'success' && format('{0}/cargo-units.jsonl', runner.temp) || '' }}
+      - name: Save Go build cache
+        if: ${{ !cancelled() && github.ref == 'refs/heads/dev' }}
+        continue-on-error: true
+        uses: ./.github/actions/build-cache
+        with:
+          phase: save
+          language: go
+          key: ${{ steps.go-cache.outputs.key }}
+          bucket: ${{ steps.go-cache.outputs.bucket }}
+          paths: ${{ steps.go-cache.outputs.paths }}

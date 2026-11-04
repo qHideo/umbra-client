@@ -1,0 +1,614 @@
+name: CI
+
+# Pull requests run preflight, then Linux checks and a Windows/macOS subset when runtime inputs
+# change. Rust jobs build the whole workspace, so the cache leaves only changed crates and their
+# dependents to compile; preflight's `devtool ci-plan` limits tests to those crates, and the
+# Windows and macOS jobs to changes in crates declaring that platform. Scheduled and manual runs are full: every test, clippy and Go check on
+# all three OSes. `ci-ok` passes when every job succeeded or was intentionally skipped.
+on:
+  pull_request:
+  schedule:
+    - cron: "41 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Verification needs assertions, but not large debug-symbol artifacts.
+# Must match ci-cache.yml so compiler outputs can be reused.
+env:
+  # The build cache saves target/, so CI keeps intermediates there instead of the shared build-dir.
+  CARGO_BUILD_BUILD_DIR: "{workspace-root}/target"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+jobs:
+  changes:
+    name: Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.plan.outputs.run }}
+      full: ${{ steps.plan.outputs.full }}
+      runtime: ${{ github.event_name != 'pull_request' || steps.classify.outputs.runtime != 'false' }}
+      os: ${{ steps.plan.outputs.os }}
+      packaging: ${{ steps.plan.outputs.full == 'true' || steps.filter.outputs.packaging == 'true' }}
+      physics: ${{ steps.plan.outputs.full == 'true' || steps.filter.outputs.physics == 'true' }}
+      scripts: ${{ steps.plan.outputs.full == 'true' || steps.filter.outputs.scripts == 'true' }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          full=false run=true
+          if [ "$EVENT" != pull_request ]; then full=true; fi
+          # A scheduled run is skipped only when a full run already passed on this commit, so failed
+          # or interrupted runs are retried.
+          if [ "$EVENT" = schedule ]; then
+            passed=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&status=success&per_page=50" \
+              --jq "[.workflow_runs[] | select(.id != $RUN_ID and .event != \"pull_request\")] | length")
+            if [ "$passed" -gt 0 ]; then run=false; fi
+          fi
+          if [ "$full" = true ]; then
+            os='["ubuntu-latest","windows-latest","macos-latest"]'
+          else
+            os='["ubuntu-latest"]'
+          fi
+          { echo "full=$full"; echo "run=$run"; echo "os=$os"; } >> "$GITHUB_OUTPUT"
+      - id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            packaging:
+              - .github/workflows/ci.yml
+              - .github/workflows/package.yml
+              - .github/actions/**
+              - .github/tests/**
+              - packaging/**
+            physics:
+              - .github/workflows/ci.yml
+              - Makefile
+              - assets/bedrock-target.json
+              - crates/assets/data/block-physics-*
+              - tools/registrygen/**
+            scripts:
+              - .github/workflows/ci.yml
+              - scripts/**
+              - assets/bedrock-target.json
+              - assets/vanilla-source.json
+              - core/go.mod
+      - name: Classify standalone documentation changes
+        id: classify
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          gh api "repos/$REPO/compare/$BASE_SHA...$HEAD_SHA?per_page=100" > "$RUNNER_TEMP/pr-files.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+
+          # Devtool selects owning Rust packages; this allowlist skips Go and Platform work too.
+          # It is deliberately narrower than tools/devtool/src/selection.rs: reference docs,
+          # crate docs, assets, workflows, packaging and unknown doc directories keep all checks.
+          def standalone_doc(name):
+              """Accept only standalone contributor docs outside runtime and architecture inputs."""
+              path = PurePosixPath(name)
+              return name in {"README.md", "AGENTS.md", "LICENSE", "THIRD_PARTY_NOTICES.md"} or (
+                  str(path.parent) in {"docs", "docs/agents", "docs/reviews"} and path.suffix == ".md"
+              )
+
+          comparison = json.loads((Path(os.environ["RUNNER_TEMP"]) / "pr-files.json").read_text())
+          files = comparison["files"]
+          # Compare returns at most 300 files. At the cap or with a count mismatch, run everything.
+          # Renames must be standalone docs on both sides; unknown inputs keep every check.
+          docs_only = 0 < len(files) < 300 and len(files) == int(os.environ["CHANGED_FILES"]) and all(
+              standalone_doc(file["filename"])
+              and standalone_doc(file.get("previous_filename", file["filename"]))
+              for file in files
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"runtime={str(not docs_only).lower()}", file=output)
+          PY
+
+  preflight:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Pull requests only; full runs ignore these and check the whole workspace.
+    outputs:
+      scope: ${{ steps.affected.outputs.scope }}
+      macos: ${{ steps.affected.outputs.macos }}
+      windows: ${{ steps.affected.outputs.windows }}
+      names: ${{ steps.affected.outputs.names }}
+      tests: ${{ steps.affected.outputs.tests }}
+      macos_tests: ${{ steps.affected.outputs.macos_tests }}
+      windows_tests: ${{ steps.affected.outputs.windows_tests }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The merge commit's first parent is the base it is compared against.
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Restore Rust build cache
+        uses: ./.github/actions/build-cache
+      - name: Plan affected checks
+        id: affected
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        shell: bash
+        run: cargo run -p devtool --locked -- ci-plan --base HEAD^1 | tee -a "$GITHUB_OUTPUT"
+      - name: Enforce architecture boundaries
+        if: ${{ !cancelled() }}
+        run: cargo run -p architecture --locked -- check --root . --policy tools/architecture/policy.toml
+      - name: Check the wgpu fork pin is on its release branch
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/wgpu_fork_pin.py Cargo.toml
+      - name: Check the Bevy fork pin is on its release branch
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/bevy_fork_pin.py Cargo.toml
+
+  # Full runs retain every diagnostic and cache writer even when preflight fails.
+  verify:
+    needs: [changes, preflight]
+    if: >-
+      !cancelled() && needs.changes.result == 'success'
+      && needs.changes.outputs.run == 'true' && needs.changes.outputs.runtime == 'true'
+      && (needs.changes.outputs.full == 'true'
+        || (needs.preflight.result == 'success' && needs.preflight.outputs.scope != 'none'))
+    runs-on: ubuntu-latest
+    # Slower runners can use more than 45 minutes on the full checks.
+    timeout-minutes: 60
+    env:
+      FULL: ${{ needs.changes.outputs.full }}
+      AFFECTED: ${{ needs.preflight.outputs.names }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: clippy
+      - name: Restore Rust build cache
+        id: rust-cache
+        uses: ./.github/actions/build-cache
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+          cache: false
+      - name: Install Linux desktop development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libwayland-dev libxkbcommon-dev libasound2-dev libudev-dev
+      - name: Verify Linux window backends
+        run: |
+          cargo tree -e features -p cinnabar --target x86_64-unknown-linux-gnu --locked | grep -F 'bevy feature "wayland"'
+          cargo tree -e features -p cinnabar --target x86_64-unknown-linux-gnu --locked | grep -F 'bevy feature "x11"'
+      # The checks below are independent, so each reports even when an earlier one fails.
+      # Whole-workspace builds match the cached features, so only affected crates are linted.
+      - name: Lint Rust workspace
+        if: ${{ !cancelled() }}
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Lint off-by-default features
+        if: ${{ !cancelled() }}
+        run: |
+          affected() { [ "$FULL" = true ] || [[ " $AFFECTED " == *" $1 "* ]]; }
+          if affected render; then
+            cargo clippy -p render --features enhanced --all-targets --locked -- -D warnings
+          fi
+          if affected cinnabar; then
+            cargo clippy -p cinnabar --features enhanced,developer-control,tracy --locked -- -D warnings
+            cargo clippy -p cinnabar --features reports --tests --locked -- -D warnings
+          fi
+          if affected ui-snapshot; then
+            cargo clippy -p ui-snapshot --features test-support --all-targets --locked -- -D warnings
+          fi
+      - name: Test developer control adapters
+        if: ${{ !cancelled() && (env.FULL == 'true' || contains(format(' {0} ', env.AFFECTED), ' cinnabar ')) }}
+        run: cargo test -p cinnabar --features developer-control --lib --locked -- developer_control
+      # The editor site ships ui-engine as WebAssembly; Pages only builds it after a merge.
+      - name: Check the JSON-UI editor for WebAssembly
+        if: ${{ !cancelled() && (env.FULL == 'true' || contains(format(' {0} ', env.AFFECTED), ' jsonui-editor ')) }}
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo check -p jsonui-editor --lib --target wasm32-unknown-unknown --locked
+      - name: Test acceptance dry run and protocol provenance
+        if: ${{ !cancelled() }}
+        run: bash scripts/tests/acceptance_test.sh
+
+  browser:
+    name: Browser target and JavaScript edges
+    needs: changes
+    if: needs.changes.outputs.run == 'true' && needs.changes.outputs.runtime == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Restore Rust build cache
+        uses: ./.github/actions/build-cache
+      - name: Check browser crates and JavaScript edges
+        run: cargo run -p devtool --locked -- check-web
+
+  rust-tests:
+    permissions:
+      contents: read
+      actions: write
+    name: Rust tests (${{ matrix.os }})
+    needs: [changes, preflight]
+    if: >-
+      !cancelled() && needs.changes.result == 'success'
+      && needs.changes.outputs.run == 'true' && needs.changes.outputs.runtime == 'true'
+      && (needs.changes.outputs.full == 'true'
+        || (needs.preflight.result == 'success' && needs.preflight.outputs.scope != 'none'))
+    runs-on: ${{ matrix.os }}
+    # Cold macOS and Windows builds need time to finish the tests, documentation and lint checks.
+    # Slower Windows runners take about 70 minutes to build and lint, and over 65 to run the tests.
+    timeout-minutes: ${{ matrix.os == 'ubuntu-latest' && 90 || matrix.os == 'windows-latest' && 180 || 150 }}
+    env:
+      TESTS: ${{ needs.changes.outputs.full == 'true' && 'all()' || needs.preflight.outputs.tests }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.changes.outputs.os) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: clippy
+      - name: Restore Rust build cache
+        id: rust-cache
+        uses: ./.github/actions/build-cache
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+          cache: false
+      - name: Restore Go build cache
+        id: go-cache
+        uses: ./.github/actions/build-cache
+        with:
+          language: go
+      - name: Install Linux desktop development libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libwayland-dev libxkbcommon-dev libasound2-dev libudev-dev spirv-tools
+      # Builds the whole workspace, which the cache keeps fresh, and runs only affected tests.
+      # Cargo's messages name every unit these builds use, fresh ones included; saves leave out the rest.
+      - name: Build Rust tests
+        id: build-tests
+        shell: bash
+        run: >-
+          cargo nextest run --workspace --locked --no-run ${{ runner.os == 'Linux' && '--timings' || '' }}
+          --cargo-message-format json-render-diagnostics > "$RUNNER_TEMP/cargo-units.jsonl"
+      # Linux lints in `verify`.
+      - name: Lint Rust workspace
+        id: lint
+        if: ${{ !cancelled() && runner.os != 'Linux' }}
+        shell: bash
+        run: >-
+          cargo clippy --workspace --all-targets --locked --message-format json-render-diagnostics
+          -- -D warnings >> "$RUNNER_TEMP/cargo-units.jsonl"
+      # Windows archives to workflow artifacts, which keep the test binaries, so it saves before
+      # the tests and a slow or timed-out test run still leaves dev a warm cache.
+      - name: Save Windows Rust build cache
+        if: ${{ !cancelled() && github.ref == 'refs/heads/dev' && runner.os == 'Windows' }}
+        continue-on-error: true
+        uses: ./.github/actions/build-cache
+        with:
+          phase: save
+          key: ${{ steps.rust-cache.outputs.key }}
+          bucket: ${{ steps.rust-cache.outputs.bucket }}
+          paths: ${{ steps.rust-cache.outputs.paths }}
+          # A failed build reports only some of its units, so its save keeps them all.
+          cargo-messages: >-
+            ${{ steps.build-tests.outcome == 'success' && steps.lint.outcome == 'success'
+            && format('{0}/cargo-units.jsonl', runner.temp) || '' }}
+      - name: Test affected Rust packages
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: cargo nextest run --workspace -E "$TESTS" --locked --no-fail-fast --no-tests=warn
+      - name: Upload Linux test build timings
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-timings-linux-tests
+          path: target/cargo-timings/cargo-timing.html
+          if-no-files-found: warn
+      - name: Test Rust doc examples
+        if: ${{ !cancelled() }}
+        run: cargo test --doc --workspace --locked
+      # The shared cache store drops linked test binaries, so macOS saves after the tests.
+      - name: Save macOS Rust build cache
+        if: ${{ !cancelled() && github.ref == 'refs/heads/dev' && runner.os == 'macOS' }}
+        continue-on-error: true
+        uses: ./.github/actions/build-cache
+        with:
+          phase: save
+          key: ${{ steps.rust-cache.outputs.key }}
+          bucket: ${{ steps.rust-cache.outputs.bucket }}
+          paths: ${{ steps.rust-cache.outputs.paths }}
+          # A failed build reports only some of its units, so its save keeps them all.
+          cargo-messages: >-
+            ${{ steps.build-tests.outcome == 'success' && steps.lint.outcome == 'success'
+            && format('{0}/cargo-units.jsonl', runner.temp) || '' }}
+
+  go:
+    permissions:
+      contents: read
+      actions: write
+    name: Go (${{ matrix.os }})
+    needs: [changes, preflight]
+    if: >-
+      !cancelled() && needs.changes.result == 'success'
+      && needs.changes.outputs.run == 'true' && needs.changes.outputs.runtime == 'true'
+      && (needs.changes.outputs.full == 'true' || needs.preflight.result == 'success')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.changes.outputs.os) }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Only test steps expose race flags to Go; cache planning uses the shared configuration.
+      RACE_TEST_FLAGS: ${{ github.event_name != 'pull_request' && matrix.os == 'ubuntu-latest' && '-race' || '' }}
+      # Fixture preparation and the test helper share isolated guest intermediates.
+      EXPERIENCE_GUEST_BUILD_DIR: "{workspace-root}/target/experience-guests/build"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+          cache: false
+      - name: Restore Go build cache
+        id: go-cache
+        uses: ./.github/actions/build-cache
+        with:
+          language: go
+      - name: Build release Go core
+        run: go build -trimpath -ldflags "$(bash packaging/common/core-ldflags.sh)" -o "$RUNNER_TEMP/bedrock-core$(go env GOEXE)" ./core/cmd/bedrock-core
+      - name: Test and vet Go core
+        env:
+          GOFLAGS: ${{ env.RACE_TEST_FLAGS }}
+        run: |
+          go test ./core/...
+          unset GOFLAGS
+          go vet ./core/...
+      - name: Test and vet protocol registry tools
+        env:
+          GOFLAGS: ${{ env.RACE_TEST_FLAGS }}
+        run: |
+          go -C tools/registrygen test ./... -count=1
+          unset GOFLAGS
+          go -C tools/registrygen vet ./...
+      - name: Test protocol packet fixtures and ID contracts
+        env:
+          GOFLAGS: ${{ env.RACE_TEST_FLAGS }}
+        run: go -C tools/fixturegen test ./... -count=1
+      - name: Prepare local server Rust fixtures
+        # Keep cold fixture compilation outside Go's test-binary deadline.
+        # Separate native builds preserve the feature sets requested by the test helpers.
+        run: |
+          cargo build -p cinnabar-cxb --locked
+          cargo build -p experience-runtime --locked
+          CARGO_BUILD_BUILD_DIR="$EXPERIENCE_GUEST_BUILD_DIR" cargo build --locked --target wasm32-unknown-unknown -p experience-probe --target-dir target/experience-guests
+      - name: Test and vet local server Experiences
+        working-directory: tools/localserver
+        env:
+          GOWORK: "off"
+          GOFLAGS: ${{ env.RACE_TEST_FLAGS }}
+        run: |
+          go test ./... -count=1
+          unset GOFLAGS
+          go vet ./...
+      - name: Test and vet pinned chunk fixture generator
+        if: runner.os == 'Linux'
+        working-directory: tools/chunkfix
+        env:
+          GOWORK: "off"
+          GOFLAGS: ${{ env.RACE_TEST_FLAGS }}
+        run: |
+          go test ./... -count=1
+          unset GOFLAGS
+          go vet ./...
+      - name: Test and vet pinned bedsim movement trace generator
+        if: runner.os == 'Linux'
+        working-directory: tools/bedsimtrace
+        env:
+          GOWORK: "off"
+          GOFLAGS: ${{ env.RACE_TEST_FLAGS }}
+        run: |
+          go test ./... -count=1
+          unset GOFLAGS
+          go vet ./...
+
+      - name: Save Go build cache
+        if: ${{ !cancelled() && github.ref == 'refs/heads/dev' }}
+        continue-on-error: true
+        uses: ./.github/actions/build-cache
+        with:
+          phase: save
+          language: go
+          key: ${{ steps.go-cache.outputs.key }}
+          bucket: ${{ steps.go-cache.outputs.bucket }}
+          paths: ${{ steps.go-cache.outputs.paths }}
+
+  # Pull requests only; full runs cover Windows and macOS through rust-tests and go.
+  platform:
+    name: Platform (${{ matrix.os }})
+    needs: [changes, preflight]
+    if: >-
+      !cancelled() && needs.changes.result == 'success'
+      && needs.changes.outputs.run == 'true' && needs.changes.outputs.runtime == 'true'
+      && needs.changes.outputs.full != 'true'
+      && needs.preflight.result == 'success'
+      && (needs.preflight.outputs.macos == 'true' || needs.preflight.outputs.windows == 'true')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+        # Each OS runs only for changes to crates that declare it, shaders, workflows, or the
+        # whole workspace.
+        exclude:
+          - os: ${{ needs.preflight.outputs.macos == 'true' && 'none' || 'macos-latest' }}
+          - os: ${{ needs.preflight.outputs.windows == 'true' && 'none' || 'windows-latest' }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Affected crates declaring this platform; `none()` when there are none.
+      PLATFORM: ${{ matrix.os == 'macos-latest' && needs.preflight.outputs.macos_tests || needs.preflight.outputs.windows_tests }}
+      # These GPU witnesses exhaust the PR budget on the software WARP adapter.
+      # macOS PRs and full Windows runs still cover every excluded case.
+      WINDOWS_SKIP: >-
+        test(=gpu_culling::direct::occlusion_cuts_submitted_terrain_only_while_the_view_holds_still)
+        | test(=terrain_seams::near_merged_floors_far_from_origin_leave_no_seam_pixels)
+        | test(=terrain_seams::sealing_grows_silhouettes_by_less_than_a_pixel)
+        | test(=terrain_seams::sealing_keeps_face_interiors_in_place)
+        | test(=world_seams::far_from_origin_floors_of_cubes_slabs_and_water_leave_no_seam_pixels)
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: clippy
+      - name: Restore Rust build cache
+        id: rust-cache
+        uses: ./.github/actions/build-cache
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+          cache: false
+      - name: Restore Go build cache
+        id: go-cache
+        uses: ./.github/actions/build-cache
+        with:
+          language: go
+      # The same whole-workspace commands as full runs, whose cache then leaves only affected
+      # crates to build. A package subset would unify features differently and rebuild dependencies.
+      - name: Lint Rust workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build release Go core
+        run: go build -trimpath -ldflags "$(bash packaging/common/core-ldflags.sh)" -o "$RUNNER_TEMP/bedrock-core$(go env GOEXE)" ./core/cmd/bedrock-core
+      - name: Test Go local transport and credential storage
+        run: go test ./core/internal/streamnet ./core/internal/lockfile ./core/authcache
+      - name: Test affected platform crates
+        if: env.PLATFORM != 'none()'
+        run: |
+          filter="$PLATFORM"
+          if [ "$RUNNER_OS" = Windows ]; then filter="($PLATFORM) & not ($WINDOWS_SKIP)"; fi
+          cargo nextest run --workspace -E "$filter" --locked --no-fail-fast --no-tests=warn
+
+  packaging:
+    name: Packaging tests
+    needs: changes
+    if: needs.changes.outputs.run == 'true' && needs.changes.outputs.packaging == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Test build cache reuse and invalidation
+        run: python3 -m unittest discover -s .github/tests -p 'test_*.py'
+      - name: Test manual release preparation
+        env:
+          PYTHONDONTWRITEBYTECODE: 1
+        run: python3 -m unittest discover -s packaging/tests -p 'test_*.py'
+      - name: Test DMG retry and cleanup
+        run: bash packaging/tests/make-dmg.sh
+      - name: Test MSI payload extraction
+        shell: pwsh
+        run: ./packaging/tests/extract-msi.Tests.ps1
+
+  macos-physics-bootstrap:
+    needs: changes
+    if: needs.changes.outputs.run == 'true' && needs.changes.outputs.physics == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+          cache: false
+      - name: Restore Go build cache
+        id: go-cache
+        uses: ./.github/actions/build-cache
+        with:
+          language: go
+      - name: Install and verify the manifest-owned physics carrier through Make
+        run: make physics-assets
+
+  powershell-harness:
+    name: PowerShell harness
+    needs: changes
+    if: needs.changes.outputs.run == 'true' && needs.changes.outputs.scripts == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+          cache: false
+      - name: Test Windows PowerShell 5.1 acceptance harness and dry-run contract
+        shell: powershell
+        run: .\scripts\tests\acceptance.Tests.ps1
+
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs:
+      - changes
+      - preflight
+      - verify
+      - rust-tests
+      - browser
+      - go
+      - platform
+      - packaging
+      - macos-physics-bootstrap
+      - powershell-harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every job to pass or be skipped
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1

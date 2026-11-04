@@ -1,0 +1,52 @@
+{
+  "repository": "qHideo/umbra-client",
+  "checksums": "SHA256SUMS.txt",
+  "assets": {
+    "linux": {
+      "x86_64": "Umbra-x86_64.AppImage"
+    },
+    "windows": {
+      "x86_64": "Umbra-x64-setup.exe"
+    },
+    "macos": {
+      "arm64": "Umbra-arm64.dmg",
+      "x86_64": "Umbra-x86_64.dmg"
+    }
+  },
+  "manual_assets": {
+    "android": {
+      "arm64": "Umbra-arm64-v8a.apk"
+    }
+  },
+  "portable_assets": {
+    "windows": {
+      "x86_64": "Umbra-Client-Windows-x64.zip"
+    }
+  },
+  "symbols": {
+    "archive": "umbra-symbols-{version}-{platform}-{arch}.zip",
+    "manifest": "manifest.json"
+  },
+  "install_script": "install.sh",
+  "linux_install": {
+    "app_dir": "app",
+    "current": "current"
+  },
+  "update_payload_prefix": "update-payload-",
+  "update_channels": {
+    "beta": {
+      "track": "tagged",
+      "manifest": "update-beta.json"
+    },
+    "nightly": {
+      "track": "rolling",
+      "tag": "nightly",
+      "manifest": "update-nightly.json"
+    }
+  },
+  "update_assets": {
+    "windows": {
+      "x86_64": "Umbra-x64.msi"
+    }
+  }
+}

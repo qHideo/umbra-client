@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#080a12">
+  <meta name="description" content="Umbra Client is a free, noncommercial Minecraft Bedrock client built in Rust.">
+  <title>Umbra Client — Bedrock, beyond the ordinary</title>
+  <style>
+    :root { color-scheme: dark; --bg:#080a12; --panel:#101321; --muted:#a4a9bb; --line:#26293c; --violet:#a78bfa; --cyan:#78dcff; }
+    * { box-sizing:border-box; }
+    html { scroll-behavior:smooth; }
+    body { margin:0; color:#f5f4fb; background:radial-gradient(ellipse at 76% 5%,#202041 0,transparent 33rem),var(--bg); font:16px/1.6 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+    a { color:inherit; text-decoration:none; }
+    .wrap { width:min(1120px,calc(100% - 40px)); margin:auto; }
+    header { height:78px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid #ffffff12; }
+    .brand { display:flex; align-items:center; gap:12px; font-weight:750; letter-spacing:.02em; }
+    .brand img { width:38px;height:38px; }
+    nav { display:flex; gap:28px; color:#c1c2d0; font-size:14px; }
+    nav a:hover { color:white; }
+    .hero { min-height:660px; display:grid; grid-template-columns:1.05fr .95fr; align-items:center; gap:24px; padding:76px 0 90px; }
+    .eyebrow { color:#b8a6ff; text-transform:uppercase; letter-spacing:.2em; font-size:12px; font-weight:700; }
+    h1 { max-width:680px; margin:16px 0; font-size:clamp(46px,6.5vw,78px); line-height:1.02; letter-spacing:-.065em; }
+    h1 span { background:linear-gradient(100deg,var(--violet),var(--cyan)); color:transparent; background-clip:text; }
+    .lede { max-width:540px; margin:24px 0 32px; color:#b7bacb; font-size:18px; }
+    .actions { display:flex; flex-wrap:wrap; gap:12px; }
+    .button { display:inline-flex; align-items:center; justify-content:center; min-height:48px; padding:0 20px; border:1px solid #ffffff24; border-radius:12px; background:#ffffff09; font-weight:650; }
+    .button.primary { color:#080a12; border:0; background:linear-gradient(105deg,#c0a8ff,#77ddff); box-shadow:0 8px 35px #8c79ff35; }
+    .button:hover { transform:translateY(-1px); filter:brightness(1.08); }
+    .small { margin-top:14px; color:#888da2; font-size:12px; }
+    .art { position:relative; display:grid; place-items:center; min-height:420px; }
+    .glow { position:absolute; width:350px;height:350px; border-radius:50%; background:#846fff24; filter:blur(75px); }
+    .art img { position:relative; width:min(100%,580px); filter:drop-shadow(0 25px 70px #0009); }
+    .status { position:absolute; right:0; bottom:35px; padding:13px 17px; border:1px solid #ffffff18; border-radius:14px; background:#101321df; color:#ccd0de; font-size:13px; backdrop-filter:blur(14px); }
+    .status b { color:#8ce1b2; }
+    section { padding:74px 0; border-top:1px solid #ffffff10; }
+    h2 { margin:0 0 12px; font-size:34px; letter-spacing:-.04em; }
+    .intro { max-width:640px; color:var(--muted); }
+    .grid { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; margin-top:32px; }
+    .card { min-height:190px; padding:24px; border:1px solid var(--line); border-radius:18px; background:linear-gradient(145deg,#141727,#0c0f19); }
+    .icon { display:grid;place-items:center;width:38px;height:38px;margin-bottom:17px;border-radius:12px;background:#a78bfa1c;color:#c4b5fd;font-size:18px; }
+    .card h3 { margin:0 0 8px;font-size:17px; }
+    .card p { margin:0;color:#a4a9bb;font-size:14px; }
+    .download { display:flex; align-items:center; justify-content:space-between; gap:24px; padding:30px; border:1px solid #8572db55; border-radius:20px; background:radial-gradient(ellipse at 100% 50%,#7566bd25,transparent 50%),#111321; }
+    .download p { max-width:620px; margin:4px 0 0;color:var(--muted); }
+    .badge { display:inline-block;margin-top:15px;padding:5px 10px;border:1px solid #ffffff20;border-radius:99px;color:#c8bbff;font-size:12px; }
+    .downloads { display:flex;flex-wrap:wrap;gap:10px;margin-top:20px; }
+    .downloads a { padding:9px 13px;border:1px solid #ffffff24;border-radius:10px;background:#ffffff08;font-size:13px;font-weight:650; }
+    .downloads a:hover { border-color:#a78bfa99; }
+    footer { padding:28px 0 40px;color:#83889c;font-size:13px; }
+    footer .wrap { display:flex;justify-content:space-between;gap:20px; }
+    @media(max-width:760px) { nav{gap:14px;font-size:12px}.hero{grid-template-columns:1fr;padding:60px 0 40px;min-height:auto}.art{min-height:320px}.art img{max-width:440px}.status{right:4%;bottom:12px}.grid{grid-template-columns:1fr}.download{align-items:flex-start;flex-direction:column} }
+    @media(max-width:440px) { nav a:nth-child(2){display:none}.wrap{width:calc(100% - 28px)}h1{font-size:48px}footer .wrap{flex-direction:column} }
+  </style>
+</head>
+<body>
+  <header class="wrap">
+    <a class="brand" href="#top"><img src="../../assets/branding/client-badge.png" alt=""><span>UMBRA CLIENT</span></a>
+    <nav aria-label="Main navigation"><a href="#features">Features</a><a href="#about">About</a><a href="#download">Download</a></nav>
+  </header>
+  <main id="top">
+    <div class="wrap hero">
+      <div>
+        <div class="eyebrow">A new way to play Bedrock</div>
+        <h1>Bedrock,<br><span>beyond ordinary.</span></h1>
+        <p class="lede">A community-built Minecraft Bedrock client, written in Rust. Make your world feel like yours.</p>
+        <div class="actions"><a class="button primary" href="#download">Get Umbra Client</a><a class="button" href="#features">Explore features</a></div>
+        <div class="small">Free for noncommercial hobby use · Available builds are listed below</div>
+      </div>
+      <div class="art"><div class="glow"></div><img src="../../assets/branding/title.png" alt="Umbra Client crescent logo and wordmark"><div class="status"><b>● Umbra Client</b><br>Made for Minecraft Bedrock</div></div>
+    </div>
+    <section id="features"><div class="wrap">
+      <div class="eyebrow">Built for your playstyle</div><h2>Your game, your way.</h2><p class="intro">A native Rust client with a custom launcher, connected features and room to make the experience your own.</p>
+      <div class="grid">
+        <article class="card"><div class="icon">◈</div><h3>Made for Bedrock</h3><p>Connect to Bedrock servers with a client built around the game’s native network and world systems.</p></article>
+        <article class="card"><div class="icon">✧</div><h3>Personalize your client</h3><p>Custom skins, resource packs, shader support and community-built mods.</p></article>
+        <article class="card"><div class="icon">◉</div><h3>Play together</h3><p>Discord rich presence and friend features help you find your next session.</p></article>
+      </div>
+    </div></section>
+    <section id="about"><div class="wrap"><div class="eyebrow">Independent community project</div><h2>Built with care. Shared for free.</h2><p class="intro">Umbra is an unofficial, noncommercial rebrand based on Cinnabar. It is not approved by or associated with Mojang or Microsoft. Minecraft is a trademark of Microsoft Corporation. The client is still in development, and server compatibility may vary.</p></div></section>
+    <section id="download"><div class="wrap"><div class="download"><div><div class="eyebrow">Umbra releases</div><h2>Get the latest build.</h2><p>Downloads come from the Umbra project's GitHub releases. Check the release notes and platform requirements before installing.</p><div id="downloads-state" role="status" aria-live="polite"><span class="badge">Checking for a release…</span></div><div class="downloads" id="downloads"></div></div><a class="button" id="release-link" href="https://github.com/REPLACE_WITH_UMBRAS_GITHUB_OWNER/umbra-client/releases" rel="noopener noreferrer">Browse releases</a></div></div></section>
+  </main>
+  <footer><div class="wrap"><span>© Umbra Client contributors · Free, noncommercial hobby project</span><span>Unofficial Minecraft Bedrock client</span></div></footer>
+  <script>
+    const repository = "__UMBRA_GITHUB_REPOSITORY__";
+    const choices = __UMBRA_DOWNLOAD_CHOICES__;
+    const state = document.getElementById("downloads-state");
+    const links = document.getElementById("downloads");
+    const releasePage = document.getElementById("release-link");
+    if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) {
+      const base = `https://github.com/${repository}`;
+      releasePage.href = `${base}/releases`;
+      fetch(`https://api.github.com/repos/${repository}/releases/latest`, { headers: { Accept: "application/vnd.github+json" } })
+        .then(response => { if (!response.ok) throw new Error("No published release yet"); return response.json(); })
+        .then(release => {
+          for (const choice of choices) {
+            const asset = release.assets.find(item => item.name === choice.filename);
+            if (!asset) continue;
+            const link = document.createElement("a");
+            link.href = asset.browser_download_url;
+            link.textContent = `Download for ${choice.label}`;
+            link.rel = "noopener noreferrer";
+            links.append(link);
+          }
+          state.innerHTML = "";
+          const badge = document.createElement("span");
+          badge.className = "badge";
+          badge.textContent = links.childElementCount ? `Latest: ${release.tag_name}` : "Release found, but no client downloads are attached yet";
+          state.append(badge);
+        })
+        .catch(() => {
+          state.innerHTML = "";
+          const badge = document.createElement("span");
+          badge.className = "badge";
+          badge.textContent = "No download published yet";
+          state.append(badge);
+        });
+    } else {
+      state.innerHTML = "";
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = "Release hosting is not configured";
+      state.append(badge);
+    }
+  </script>
+</body>
+</html>
