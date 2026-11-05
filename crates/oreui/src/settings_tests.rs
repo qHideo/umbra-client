@@ -105,32 +105,23 @@ fn native_video_settings_exposes_smaa_and_supported_msaa_stops_together() {
 }
 
 #[test]
-fn settings_oreui_body_and_heading_choose_separate_runtime_fonts() {
+fn settings_oreui_body_and_heading_share_the_bundled_inter_face() {
     use ui::oreui_theme::OreUiFont;
 
     let base = fixture_font();
+    let inter = base.as_ref().clone().with_linear_sampling();
     let font = base
-        .with_named_font(OreUiFont::Seven.name(), &base)
-        .unwrap()
-        .with_named_font(OreUiFont::Ten.name(), &base)
+        .with_named_font(OreUiFont::Seven.theme_name(), &inter)
         .unwrap();
-    let body_page = font
-        .font_named(OreUiFont::Seven.name())
-        .glyph('0')
-        .unwrap()
-        .page;
-    let heading_page = font
-        .font_named(OreUiFont::Ten.name())
+    let inter_page = font
+        .font_named(OreUiFont::Seven.theme_name())
         .glyph('0')
         .unwrap()
         .page;
     let metrics = TextMetrics::for_viewport([1280, 720], ui::DpiScale::new(1.0).unwrap(), Some(2));
     let (mut nodes, mut next, mut layouts) = (Vec::new(), 1, ui::TextLayoutCache::new(8, 65536));
     let mut canvas = Canvas::new(&mut nodes, &mut next, &mut layouts, &font, metrics, 0, None);
-    for (style, expected_page) in [
-        (theme::BODY, body_page),
-        (theme::SECTION_HEADER, heading_page),
-    ] {
+    for style in [theme::BODY, theme::SECTION_HEADER] {
         canvas
             .text("0", [0.0, 0.0], 200.0, style, theme::TEXT, false)
             .unwrap();
@@ -141,11 +132,14 @@ fn settings_oreui_body_and_heading_choose_separate_runtime_fonts() {
             layout
                 .glyphs()
                 .iter()
-                .all(|glyph| glyph.page == expected_page),
-            "OreUI semantic text must use its installed font face"
+                .all(|glyph| glyph.page == inter_page),
+            "OreUI text roles must use the shared Inter face"
         );
     }
-    assert_ne!(body_page, heading_page);
+    assert_eq!(
+        theme::BODY.face.theme_name(),
+        theme::SECTION_HEADER.face.theme_name()
+    );
     assert_eq!(
         font.glyph('0'),
         base.glyph('0'),
@@ -177,9 +171,7 @@ fn settings_small_text_selects_native_rasters_by_physical_size() {
         (8, face(8, FontRendering::NativeCoverage)),
     ]);
     let font = base
-        .with_named_font_sizes(OreUiFont::Seven.name(), &sdf, &sizes)
-        .unwrap()
-        .with_named_font_sizes(OreUiFont::Ten.name(), &sdf, &sizes)
+        .with_named_font_sizes(OreUiFont::Seven.theme_name(), &sdf, &sizes)
         .unwrap();
     for (gui, dpi, style, rendering, em) in [
         (1, 1.0, theme::CAPTION, FontRendering::NativeCoverage, 7),
@@ -744,7 +736,7 @@ fn settings_native_font_keeps_css_line_boxes_and_pointer_caret_in_sync() {
         })
         .unwrap();
     let font = base
-        .with_named_font(OreUiFont::Seven.name(), &native)
+        .with_named_font(OreUiFont::Seven.theme_name(), &native)
         .unwrap();
     let metrics = TextMetrics::for_viewport([1280, 720], ui::DpiScale::new(1.0).unwrap(), Some(2));
     let (mut nodes, mut next, mut layouts) = (Vec::new(), 1, ui::TextLayoutCache::new(16, 65536));
