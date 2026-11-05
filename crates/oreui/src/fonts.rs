@@ -67,7 +67,15 @@ fn shared_fallback(
     let sans = carriers::FONT.font_face.unwrap();
     let manifest = assets::canonical_source_manifest_sha256(sans.manifest);
     let font = if combined.identity().source_manifest_sha256 == manifest {
-        combined.clone()
+        // The bundled Inter carrier can itself be the base catalog. Preserve its semantic line
+        // metrics on the catalog passed to JSON-UI and OreUI; applying them only to this temporary
+        // fallback clone leaves the actual text renderer on pixel-font metrics.
+        let font = combined
+            .clone()
+            .with_line_metrics(sans.line_metrics())
+            .map_err(|e| e.to_string())?;
+        *combined = font.clone();
+        font
     } else {
         let decoded = RuntimeFontCatalog::decode(
             &read_bounded(&compiled_dir.join(carriers::FONT.output))?,
