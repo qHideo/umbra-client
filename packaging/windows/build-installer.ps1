@@ -32,6 +32,9 @@ foreach ($name in $runtimeNames) { Copy-Item (Join-Path $release $name) $payload
 & (Join-Path $PSScriptRoot "fetch-dxc.ps1") -Root $root -Out $payload
 & (Join-Path $PSScriptRoot "stage-prep-kit.ps1") -Root $root -Kit $kit -Assetc (Join-Path $release "assetc.exe")
 Copy-Item (Join-Path $root "crates/assets/data/block-physics-v2225.bin") (Join-Path $resources "assets")
+$compiledFont = Join-Path $root ".local/assets/compiled/ui-inter-v1.mcbefont"
+if (-not (Test-Path -LiteralPath $compiledFont)) { throw "missing $compiledFont; run make package-binaries first" }
+Copy-Item -LiteralPath $compiledFont -Destination (Join-Path $resources "assets/ui-inter-v1.mcbefont")
 Copy-Item (Join-Path $root "THIRD_PARTY_NOTICES.md") (Join-Path $resources "assets")
 Copy-Item (Join-Path $root "LICENSE") (Join-Path $resources "licenses/Umbra-LICENSE.md")
 Copy-Item (Join-Path $root "assets/licenses/*") (Join-Path $resources "licenses")

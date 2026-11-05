@@ -69,6 +69,9 @@ stage_shared_resources() {
     local resources="$1"
     mkdir -p "$resources/assets"
     install -m 0644 "$repo_root/crates/assets/data/block-physics-v2225.bin" "$resources/assets/block-physics-v2225.bin"
+    local compiled_font="$repo_root/.local/assets/compiled/ui-inter-v1.mcbefont"
+    require_file "$compiled_font" 'run make package-binaries to compile the bundled Inter UI face'
+    install -m 0644 "$compiled_font" "$resources/assets/ui-inter-v1.mcbefont"
     install -m 0644 "$repo_root/THIRD_PARTY_NOTICES.md" "$resources/assets/THIRD_PARTY_NOTICES.md"
     mkdir -p "$resources/licenses"
     install -m 0644 "$repo_root/LICENSE" "$resources/licenses/Umbra-LICENSE.md"
@@ -99,7 +102,7 @@ resource_manifest() {
     local platform="$1" exe='' file
     [[ "$platform" != windows ]] || exe=.exe
     file="$(ui_font_path)"
-    printf '%s\n' licenses/Umbra-LICENSE.md assets/block-physics-v2225.bin assets/THIRD_PARTY_NOTICES.md "fonts/${file##*/}" "prep-kit/bin/assetc$exe"
+    printf '%s\n' licenses/Umbra-LICENSE.md assets/block-physics-v2225.bin assets/ui-inter-v1.mcbefont assets/THIRD_PARTY_NOTICES.md "fonts/${file##*/}" "prep-kit/bin/assetc$exe"
     for file in "$repo_root"/assets/licenses/*; do printf 'licenses/%s\n' "${file##*/}"; done
     prep_kit_files | sed 's|^|prep-kit/|'
 }
