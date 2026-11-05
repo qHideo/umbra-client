@@ -36,7 +36,6 @@ pub fn install(base: Arc<RuntimeFontCatalog>, compiled_dir: &Path) -> Arc<Runtim
             return base;
         }
     };
-    let mut installed = 0;
     for (face, path, font) in loaded {
         match font.and_then(|(font, sizes)| {
             combined
@@ -45,7 +44,6 @@ pub fn install(base: Arc<RuntimeFontCatalog>, compiled_dir: &Path) -> Arc<Runtim
         }) {
             Ok(font) => {
                 combined = font;
-                installed += 1;
             }
             Err(reason) => tracing::warn!(
                 "{} unavailable at {} ({reason}); using default font; rebuild with make {}-assets",
@@ -55,11 +53,9 @@ pub fn install(base: Arc<RuntimeFontCatalog>, compiled_dir: &Path) -> Arc<Runtim
             ),
         }
     }
-    if installed == 0 {
-        base
-    } else {
-        Arc::new(combined)
-    }
+    // `shared_fallback` also installs the bundled Inter face used by first-party OreUI.
+    // Keep that catalog even when there are no optional Cinnangles faces to install.
+    Arc::new(combined)
 }
 
 /// Returns the shipped Sans catalog that draws characters outside the faces' native ranges,
