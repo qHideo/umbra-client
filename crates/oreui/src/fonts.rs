@@ -74,7 +74,8 @@ fn shared_fallback(
             manifest,
         )
         .map_err(|e| e.to_string())?
-        .with_coverage_pages();
+        .with_coverage_pages()
+        .with_linear_sampling();
         *combined = combined
             .with_named_font(sans.name, &decoded)
             .map_err(|e| e.to_string())?;

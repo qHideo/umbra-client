@@ -202,8 +202,17 @@ pub(super) fn load_font_assets(
                 rebuild_command,
             }
         })?;
+    let runtime = runtime.with_coverage_pages();
+    let runtime = if source_manifest == FONT_SOURCE_JSON {
+        // Inter is an outline face rasterized onto a coverage atlas. Bilinear sampling is
+        // required when its 18 px source raster is scaled for UI labels; nearest sampling makes
+        // it look like a block font and invalidates the menu's expected text fit.
+        runtime.with_linear_sampling()
+    } else {
+        runtime
+    };
     Ok(LoadedFontAssets {
-        runtime: Arc::new(runtime.with_coverage_pages()),
+        runtime: Arc::new(runtime),
         selected_path: path,
         diagnostic: false,
     })
